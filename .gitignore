@@ -1,0 +1,7 @@
+data.zip
+logs/
+point_cloud_figure/
+.vscode/
+checkpoints/
+outputs/
+wandb/
