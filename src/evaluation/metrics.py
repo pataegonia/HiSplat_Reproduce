@@ -38,6 +38,11 @@ def compute_ssim(
     ground_truth: Float[Tensor, "batch channel height width"],
     predicted: Float[Tensor, "batch channel height width"],
 ) -> Float[Tensor, " batch"]:
+    # Clip to [0,1] so skimage SSIM with data_range=1.0 is well-defined.
+    # Without this, MSH-compressed renders can push a few pixels slightly
+    # outside [0,1] and cause NaN in the SSIM windows.
+    ground_truth = ground_truth.clip(min=0, max=1)
+    predicted = predicted.clip(min=0, max=1)
     ssim = [
         structural_similarity(
             gt.detach().cpu().numpy(),

@@ -2,10 +2,9 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from einops import einsum, rearrange
+from einops import rearrange
 from jaxtyping import Float
 from plyfile import PlyData, PlyElement
-from scipy.spatial.transform import Rotation as R
 from torch import Tensor
 
 
@@ -32,59 +31,37 @@ def export_ply(
     opacities: Float[Tensor, " gaussian"],
     path: Path,
 ):
-    # Shift the scene so that the median Gaussian is at the origin.
-    means = means - means.median(dim=0).values
+    # FCGS 압축 파이프라인용 export: 뷰어용 좌표 변환 없이 world space 그대로 저장.
+    # (centering/scaling/rotation 제거 — eval 시 원본 카메라 extrinsics와 좌표계 일치 필요)
 
-    # Rescale the scene so that most Gaussians are within range [-1, 1].
-    scale_factor = means.abs().quantile(0.95, dim=0).max()
-    means = means / scale_factor
-    scales = scales / scale_factor
+    # quaternion (w, x, y, z) 포맷으로 변환 (HiSplat 내부: x, y, z, w 순서)
+    rotations_np = rotations.detach().cpu().numpy()
+    x, y, z, w = rearrange(rotations_np, "g xyzw -> xyzw g")
+    rotations_wxyz = np.stack((w, x, y, z), axis=-1)
 
-    # Define a rotation that makes +Z be the world up vector.
-    rotation = [
-        [0, 0, 1],
-        [-1, 0, 0],
-        [0, -1, 0],
-    ]
-    rotation = torch.tensor(rotation, dtype=torch.float32, device=means.device)
+    # Export SH coefficients up to degree 3 (16 coefficients per channel).
+    # HiSplat may use sh_degree=4 (25 coeffs), but FCGS only supports degree 3 (16 coeffs).
+    # We truncate to the first 16 coefficients: DC (1) + degree1~3 rest (15).
+    SH_DEGREE_MAX = 3
+    SH_COEFFS = (SH_DEGREE_MAX + 1) ** 2  # 16
+    harmonics_truncated = harmonics[..., :SH_COEFFS]  # [N, 3, 16]
+    f_dc = harmonics_truncated[..., 0]         # [N, 3] — DC coefficients (R, G, B)
+    f_rest = harmonics_truncated[..., 1:]      # [N, 3, 15] — higher-order coefficients
+    # Reshape to channel-major [N, 45]: R0..R14, G0..G14, B0..B14
+    # This matches the GaussianModel PLY format expected by FCGS.
+    num_rest = f_rest.shape[-2] * f_rest.shape[-1]  # 3 * 15 = 45
+    f_rest_flat = f_rest.reshape(f_rest.shape[0], -1)  # [N, 45]
 
-    # The Polycam viewer seems to start at a 45 degree angle. Since we want to be
-    # looking directly at the object, we compose a 45 degree rotation onto the above
-    # rotation.
-    adjustment = torch.tensor(
-        R.from_rotvec([0, 0, -45], True).as_matrix(),
-        dtype=torch.float32,
-        device=means.device,
-    )
-    rotation = adjustment @ rotation
-
-    # We also want to see the scene in camera space (as the default view). We therefore
-    # compose the w2c rotation onto the above rotation.
-    rotation = rotation @ extrinsics[:3, :3].inverse()
-
-    # Apply the rotation to the means (Gaussian positions).
-    means = einsum(rotation, means, "i j, ... j -> ... i")
-
-    # Apply the rotation to the Gaussian rotations.
-    rotations = R.from_quat(rotations.detach().cpu().numpy()).as_matrix()
-    rotations = rotation.detach().cpu().numpy() @ rotations
-    rotations = R.from_matrix(rotations).as_quat()
-    x, y, z, w = rearrange(rotations, "g xyzw -> xyzw g")
-    rotations = np.stack((w, x, y, z), axis=-1)
-
-    # Since our axes are swizzled for the spherical harmonics, we only export the DC
-    # band.
-    harmonics_view_invariant = harmonics[..., 0]
-
-    dtype_full = [(attribute, "f4") for attribute in construct_list_of_attributes(0)]
+    dtype_full = [(attribute, "f4") for attribute in construct_list_of_attributes(num_rest)]
     elements = np.empty(means.shape[0], dtype=dtype_full)
     attributes = (
         means.detach().cpu().numpy(),
         torch.zeros_like(means).detach().cpu().numpy(),
-        harmonics_view_invariant.detach().cpu().contiguous().numpy(),
+        f_dc.detach().cpu().contiguous().numpy(),
+        f_rest_flat.detach().cpu().contiguous().numpy(),
         opacities[..., None].detach().cpu().numpy(),
         scales.log().detach().cpu().numpy(),
-        rotations,
+        rotations_wxyz,
     )
     attributes = np.concatenate(attributes, axis=1)
     elements[:] = list(map(tuple, attributes))

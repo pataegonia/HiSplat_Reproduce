@@ -16,9 +16,51 @@ from .backbone import BackbonePyramid
 from .common.gaussian_adapter import GaussianAdapter, GaussianAdapterCfg
 from .costvolume.depth_predictor_multiview import DepthPredictorMultiViewPyramid
 from .encoder import Encoder
+from .compression import HiSplatMSHCodec
 from .visualization.encoder_visualizer_costvolume_cfg import (
     EncoderVisualizerCostVolumeCfg,
 )
+
+
+@dataclass
+class CompressionCfg:
+    enabled: bool
+    N: int  # latent channels
+    M: int  # hyperprior expansion channels
+    n_downsample_per_stage: List[int]  # downsampling depth per stage
+    lmbda: float  # rate-distortion tradeoff weight
+    target: str = "refine_out"  # "pre_refine", "refine_out", or "raw_gaussians"
+    compress_sh_degree: int = 4  # only used if target=="raw_gaussians"
+    # Optional checkpoint used only to initialize the MSH codec weights after
+    # the main generator checkpoint has been loaded. This lets us keep a clean
+    # gen-only HiSplat generator while transplanting a pretrained codec.
+    codec_init_ckpt: str | None = None
+    # Per-stage rate weights. Final rate loss = lmbda * sum_i (w_i * bpp_i).
+    # Larger w_i → stronger penalty on stage_i bits → fewer bits there.
+    # Test PSNR is measured on stage 2 only, so [4, 2, 1] shifts bits to
+    # the final stage. None means uniform [1, 1, 1] (legacy behavior).
+    lambda_stage_weights: List[float | int] | None = None
+    # Per-stage IRB depth (zero-init, identity at init). None falls back to
+    # uniform [2,2,2] pre and [4,4,4] post (matches phase2step3+ defaults).
+    # To boost stage 2 capacity specifically, e.g. [2,2,4] / [4,4,8].
+    n_pre_blocks_per_stage: List[int] | None = None
+    n_post_blocks_per_stage: List[int] | None = None
+    # Use CompressAI's own dequantization rule in the training forward pass
+    # so STE reconstruction is closer to real compress/decompress.
+    actual_consistent_quant: bool = True
+    # Optional auxiliary loss for EntropyBottleneck quantile/CDF calibration.
+    # Kept off by default to preserve legacy training unless explicitly enabled.
+    entropy_aux_weight: float = 0.0
+    # Optional identity loss on the compressed tensor for feature targets.
+    feat_loss_alpha: float = 0.0
+    feat_loss_warmup_steps: int = 5000
+    feat_loss_start_step: int = 0
+    feat_loss_stage_weights: List[float | int] | None = None
+    # Train-time warmup for target="pre_refine". During training only, the
+    # frozen refine_unet sees x_orig + beta * (x_hat - x_orig), with beta
+    # ramped to 1.0. Defaults preserve the legacy direct-codec behavior.
+    pre_refine_bypass_start_step: int = 0
+    pre_refine_bypass_warmup_steps: int = 0
 
 
 @dataclass
@@ -48,6 +90,7 @@ class EncoderCostVolumeCfgPyramid:
     depth_unet_feat_dim: int
     depth_unet_attn_res: List[int]
     depth_unet_channel_mult: List[int]
+    compression: CompressionCfg | None = None
 
 
 class EncoderCostVolumePyramid(Encoder):
@@ -86,6 +129,7 @@ class EncoderCostVolumePyramid(Encoder):
         self.gaussian_adapter = GaussianAdapter(cfg.gaussian_adapter)
 
         # cost volume based depth predictor
+        gaussian_raw_channels = cfg.num_surfaces * (self.gaussian_adapter.d_in + 2)
         self.depth_predictor = DepthPredictorMultiViewPyramid(
             feature_channels=cfg.d_feature,
             upscale_factor=cfg.downscale_factor,
@@ -93,13 +137,98 @@ class EncoderCostVolumePyramid(Encoder):
             costvolume_unet_feat_dim=cfg.costvolume_unet_feat_dim,
             costvolume_unet_channel_mult=tuple(cfg.costvolume_unet_channel_mult),
             costvolume_unet_attn_res=tuple(cfg.costvolume_unet_attn_res),
-            gaussian_raw_channels=cfg.num_surfaces * (self.gaussian_adapter.d_in + 2),
+            gaussian_raw_channels=gaussian_raw_channels,
             gaussians_per_pixel=cfg.gaussians_per_pixel,
             num_views=get_cfg().dataset.view_sampler.num_context_views,
             depth_unet_feat_dim=cfg.depth_unet_feat_dim,
             depth_unet_attn_res=cfg.depth_unet_attn_res,
             depth_unet_channel_mult=cfg.depth_unet_channel_mult,
         )
+
+        # MSH compression codec (optional)
+        # Compression targets (selectable via compression.target):
+        #   - "pre_refine": compresses the feature bundle before refine_unet,
+        #     matching the MVSplat-MSH placement more closely. The frozen
+        #     refine_unet/heads remain after the codec.
+        #   - "refine_out" (default, new): compresses UNet features before the
+        #     Gaussian and depth heads so heads can compensate for quant noise.
+        #   - "raw_gaussians" (old): compresses the final to_gaussians output.
+        comp_cfg = getattr(cfg, "compression", None)
+        if comp_cfg is not None and comp_cfg.enabled:
+            target = getattr(comp_cfg, "target", "refine_out")
+            if target == "pre_refine":
+                # Bundle:
+                # stage0: image(3) + proj_feat + coarse_disp(1) + pdf_max(1)
+                # stage1/2 add pre_stage_residual(3).
+                proj_channels = [cfg.d_feature // (2 ** i) for i in range(3)]
+                in_channels_per_stage = [
+                    proj_channels[0] + 5,
+                    proj_channels[1] + 8,
+                    proj_channels[2] + 8,
+                ]
+            elif target == "refine_out":
+                base_feat_dim = cfg.depth_unet_feat_dim
+                in_channels_per_stage = [
+                    base_feat_dim * (2 ** (2 - i)) for i in range(3)
+                ]  # e.g. [128, 64, 32] for base=32
+            elif target == "raw_gaussians":
+                # All three stages share the same raw_gaussians channel count
+                in_channels_per_stage = [gaussian_raw_channels] * 3
+            else:
+                raise ValueError(f"Unknown compression target: {target}")
+            self.msh_codec = HiSplatMSHCodec(
+                in_channels_per_stage=in_channels_per_stage,
+                N=comp_cfg.N,
+                M=comp_cfg.M,
+                n_downsample_per_stage=comp_cfg.n_downsample_per_stage,
+                n_pre_blocks_per_stage=getattr(
+                    comp_cfg, "n_pre_blocks_per_stage", None
+                ),
+                n_post_blocks_per_stage=getattr(
+                    comp_cfg, "n_post_blocks_per_stage", None
+                ),
+                actual_consistent_quant=getattr(
+                    comp_cfg, "actual_consistent_quant", True
+                ),
+            )
+            self.compression_lmbda = comp_cfg.lmbda
+            self.compression_entropy_aux_weight = getattr(
+                comp_cfg, "entropy_aux_weight", 0.0
+            )
+            self.compression_lambda_stage_weights = [
+                float(w)
+                for w in (getattr(comp_cfg, "lambda_stage_weights", None) or [1.0, 1.0, 1.0])
+            ]
+            self.compression_feat_loss_alpha = getattr(comp_cfg, "feat_loss_alpha", 0.0)
+            self.compression_feat_loss_warmup_steps = getattr(
+                comp_cfg, "feat_loss_warmup_steps", 5000
+            )
+            self.compression_feat_loss_start_step = getattr(comp_cfg, "feat_loss_start_step", 0)
+            self.compression_feat_loss_stage_weights = [
+                float(w)
+                for w in (getattr(comp_cfg, "feat_loss_stage_weights", None) or [1.0, 1.0, 1.0])
+            ]
+            self.compression_pre_refine_bypass_start_step = getattr(
+                comp_cfg, "pre_refine_bypass_start_step", 0
+            )
+            self.compression_pre_refine_bypass_warmup_steps = getattr(
+                comp_cfg, "pre_refine_bypass_warmup_steps", 0
+            )
+            self.msh_target = target
+            self.msh_compress_mode = "training"
+        else:
+            self.msh_codec = None
+            self.compression_lmbda = 0.0
+            self.compression_entropy_aux_weight = 0.0
+            self.compression_lambda_stage_weights = [1.0, 1.0, 1.0]
+            self.compression_feat_loss_alpha = 0.0
+            self.compression_feat_loss_warmup_steps = 5000
+            self.compression_feat_loss_start_step = 0
+            self.compression_feat_loss_stage_weights = [1.0, 1.0, 1.0]
+            self.compression_pre_refine_bypass_start_step = 0
+            self.compression_pre_refine_bypass_warmup_steps = 0
+            self.msh_target = "none"
+            self.msh_compress_mode = "training"
 
     def map_pdf_to_opacity(
         self,

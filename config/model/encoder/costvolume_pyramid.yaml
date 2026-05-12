@@ -33,3 +33,23 @@ depth_unet_attn_res: []
 depth_unet_channel_mult: [1, 1, 1]
 downscale_factor: 4
 shim_patch_size: 4
+
+# MSH compression settings
+# Supported targets:
+#   target: "pre_refine"   -> compress the bundle before refine_unet (MVSplat-style)
+#   target: "refine_out"   -> compress UNet features before the heads
+#   target: "raw_gaussians" -> compress final to_gaussians output (old)
+compression:
+  enabled: false            # set to true to enable MSH compression
+  N: 128                    # latent bottleneck channels
+  M: 192                    # hyperprior expansion channels
+  n_downsample_per_stage:   # spatial downsampling layers per stage
+    - 2                     # stage0 (~32x44): 4x reduction
+    - 2                     # stage1 (~64x88): 4x reduction
+    - 3                     # stage2 (~128x176): 8x reduction
+  lmbda: 0.001              # rate-distortion tradeoff (higher = more compression)
+  target: "refine_out"      # "pre_refine", "refine_out", or "raw_gaussians"
+  compress_sh_degree: 4     # only used if target=="raw_gaussians"
+  codec_init_ckpt: null     # optional: transplant only MSH codec weights from this ckpt
+  actual_consistent_quant: true  # train forward uses CompressAI dequantization
+  entropy_aux_weight: 0.0   # set >0 to train EntropyBottleneck CDF calibration

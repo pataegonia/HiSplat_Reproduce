@@ -62,6 +62,11 @@ train:
   align_3d: false
   align_depth: false
   normal_norm: true
+  # MSH compression training phases
+  freeze_hisplat: false       # Phase 1: freeze encoder+decoder, train MSH only
+  unfreeze_step: 0            # Phase 2: unfreeze at this step (0=stay frozen)
+  unfreeze_lr_scale: 0.1      # lr scale for HiSplat params after unfreeze
+  render_loss_weight: 1.0     # set 0 for codec feature-AE pretraining
 
 test:
   output_path: outputs/test
@@ -70,6 +75,7 @@ test:
   save_image: false
   save_video: false
   test_all_ckpt: false
+  msh_compress_mode: actual
 
 seed: 111123
 

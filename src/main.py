@@ -38,6 +38,57 @@ def cyan(text: str) -> str:
     return f"{Fore.CYAN}{text}{Fore.RESET}"
 
 
+def load_codec_init_ckpt(encoder, codec_init_ckpt: str | None) -> None:
+    """Transplant only MSH codec weights from a checkpoint into the encoder."""
+    if not codec_init_ckpt:
+        return
+    if getattr(encoder, "msh_codec", None) is None:
+        print(f"[MSH codec init] Skipped {codec_init_ckpt}: encoder has no MSH codec.")
+        return
+
+    ckpt_path = Path(codec_init_ckpt)
+    if not ckpt_path.exists():
+        raise FileNotFoundError(f"MSH codec init checkpoint not found: {codec_init_ckpt}")
+
+    raw_ckpt = torch.load(ckpt_path, map_location="cpu")
+    state_dict = raw_ckpt.get("state_dict", raw_ckpt)
+    normalized = {}
+    for key, value in state_dict.items():
+        if key.startswith("encoder."):
+            key = key[len("encoder."):]
+        normalized[key] = value
+
+    model_dict = encoder.state_dict()
+    codec_ckpt = {}
+    skipped = []
+    for key, value in normalized.items():
+        if not key.startswith("msh_codec."):
+            continue
+        if key in model_dict and value.shape == model_dict[key].shape:
+            codec_ckpt[key] = value
+        else:
+            model_shape = model_dict[key].shape if key in model_dict else "missing"
+            skipped.append((key, value.shape, model_shape))
+
+    if not codec_ckpt:
+        raise RuntimeError(
+            f"No compatible MSH codec weights found in {codec_init_ckpt}. "
+            "Check target/N/M/downsample settings."
+        )
+
+    encoder.load_state_dict(codec_ckpt, strict=False)
+    print(
+        f"[MSH codec init] Loaded {len(codec_ckpt)} codec tensors from "
+        f"{codec_init_ckpt}"
+    )
+    if skipped:
+        print(f"[MSH codec init] Skipped {len(skipped)} incompatible codec tensors:")
+        for key, ckpt_shape, model_shape in skipped[:10]:
+            print(f"  {key}: ckpt={ckpt_shape} vs model={model_shape}")
+        if len(skipped) > 10:
+            print(f"  ... and {len(skipped) - 10} more")
+
+
 @hydra.main(
     version_base=None,
     config_path="../config",
@@ -47,6 +98,8 @@ def train(cfg_dict: DictConfig):
     cfg_dict["test"]["output_path"] = os.path.join("outputs", cfg_dict["output_dir"], "test")
     cfg = load_typed_root_config(cfg_dict)
     set_cfg(cfg_dict)
+    process_rank = int(os.environ.get("RANK", os.environ.get("SLURM_PROCID", "0")))
+    trainer_num_nodes = int(os.environ.get("HISPLAT_NUM_NODES", os.environ.get("SLURM_NNODES", "1")))
     # Set up the output directory.
     if cfg_dict.output_dir is None:
         output_dir = Path(hydra.core.hydra_config.HydraConfig.get()["runtime"]["output_dir"])
@@ -55,8 +108,13 @@ def train(cfg_dict: DictConfig):
         os.makedirs(output_dir, exist_ok=True)
     print(cyan(f"Saving outputs to {output_dir}."))
     latest_run = output_dir.parents[1] / "latest-run"
-    os.system(f"rm {latest_run}")
-    os.system(f"ln -s {output_dir} {latest_run}")
+    if process_rank == 0:
+        try:
+            if latest_run.exists() or latest_run.is_symlink():
+                latest_run.unlink(missing_ok=True)
+            latest_run.symlink_to(output_dir)
+        except (FileExistsError, FileNotFoundError):
+            pass  # Race with other concurrent runs; symlink is non-critical.
 
     # Set up logging with wandb.
     callbacks = []
@@ -98,6 +156,18 @@ def train(cfg_dict: DictConfig):
             mode="max",  # save the lastest k ckpt, can do offline test later
         )
     )
+    # Best-val ckpt: keep top-1 by stage2 validation PSNR. Prevents the
+    # final-step ckpt (overfit peak) from being the only option at test time.
+    callbacks.append(
+        ModelCheckpoint(
+            output_dir / "checkpoints",
+            save_top_k=1,
+            monitor="val/psnr_val",
+            mode="max",
+            filename="best-val-{step}",
+            auto_insert_metric_name=False,
+        )
+    )
     for cb in callbacks:
         cb.CHECKPOINT_EQUALS_CHAR = "_"
 
@@ -112,6 +182,7 @@ def train(cfg_dict: DictConfig):
         accelerator="gpu",
         logger=logger,
         devices=cfg.device,
+        num_nodes=trainer_num_nodes,
         strategy="ddp",
         callbacks=callbacks,
         val_check_interval=cfg.trainer.val_check_interval,
@@ -128,7 +199,40 @@ def train(cfg_dict: DictConfig):
     if cfg.mode == "train" and checkpoint_path is not None:
         ckpt = torch.load(checkpoint_path)["state_dict"]
         ckpt = {".".join(k.split(".")[1:]): v for k, v in ckpt.items()}
-        encoder.load_state_dict(ckpt)
+        # Partial load: skip layers with shape mismatch or missing keys
+        model_dict = encoder.state_dict()
+        filtered_ckpt = {}
+        skipped = []
+        for k, v in ckpt.items():
+            if k in model_dict and v.shape == model_dict[k].shape:
+                filtered_ckpt[k] = v
+            else:
+                skipped.append(k)
+        # Also detect model keys not present in ckpt (e.g. new MSH codec)
+        missing_in_ckpt = [k for k in model_dict if k not in ckpt]
+        if skipped or missing_in_ckpt:
+            if skipped:
+                print(f"[Partial Load] Skipped {len(skipped)} ckpt keys (shape mismatch or not in model):")
+                for k in skipped:
+                    ckpt_shape = ckpt[k].shape if k in ckpt else "missing"
+                    model_shape = model_dict[k].shape if k in model_dict else "missing"
+                    print(f"  {k}: ckpt={ckpt_shape} vs model={model_shape}")
+            if missing_in_ckpt:
+                print(f"[Partial Load] {len(missing_in_ckpt)} model keys not in ckpt (randomly initialized):")
+                for k in missing_in_ckpt[:10]:
+                    print(f"  {k}")
+                if len(missing_in_ckpt) > 10:
+                    print(f"  ... and {len(missing_in_ckpt) - 10} more")
+            encoder.load_state_dict(filtered_ckpt, strict=False)
+        else:
+            encoder.load_state_dict(ckpt)
+
+    comp_cfg = getattr(cfg.model.encoder, "compression", None)
+    codec_init_ckpt = getattr(comp_cfg, "codec_init_ckpt", None) if comp_cfg is not None else None
+    if codec_init_ckpt is not None:
+        codec_init_ckpt = update_checkpoint_path(codec_init_ckpt, cfg.wandb)
+    load_codec_init_ckpt(encoder, codec_init_ckpt)
+
     model_wrapper = ModelWrapper(
         cfg.optimizer,
         cfg.test,
@@ -150,12 +254,21 @@ def train(cfg_dict: DictConfig):
 
     if cfg.mode == "train":
         print("begin to train fit!")
-        try:
-            print(f"resume from {checkpoint_path}!!!")
-            trainer.fit(model_wrapper, datamodule=data_module, ckpt_path=checkpoint_path)
-        except:
-            print(f"start from scratch!!!")
+        # If MSH codec is present or partial load was used, skip Lightning's
+        # strict ckpt restore (encoder already loaded above).
+        has_msh = getattr(encoder, "msh_codec", None) is not None
+        used_partial_load = checkpoint_path is not None and has_msh
+        if used_partial_load:
+            print(f"[MSH mode] Encoder loaded from {checkpoint_path}, "
+                  f"skipping Lightning ckpt_path to avoid strict load.")
             trainer.fit(model_wrapper, datamodule=data_module)
+        else:
+            try:
+                print(f"resume from {checkpoint_path}!!!")
+                trainer.fit(model_wrapper, datamodule=data_module, ckpt_path=checkpoint_path)
+            except:
+                print(f"start from scratch!!!")
+                trainer.fit(model_wrapper, datamodule=data_module)
     elif cfg.mode == "test":
         trainer.test(
             model_wrapper,

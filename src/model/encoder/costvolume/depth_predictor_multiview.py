@@ -162,7 +162,10 @@ class DepthPredictorMultiViewPyramid(nn.Module):
                 )
             )
         self.depth_predictor = nn.ModuleList(depth_predictor_list)
-        self.modulater = Modulater(2 * 83, 32, mod="mul")
+        # raw_gaussians_pre/raw_gaussians_now drop the first 2 xy-offset channels and append
+        # one opacity channel before entering the modulater, so each branch has
+        # (gaussian_raw_channels - 1) features regardless of SH degree.
+        self.modulater = Modulater(2 * (gaussian_raw_channels - 1), 32, mod="mul")
 
     def forward(
         self,
@@ -222,7 +225,46 @@ class DepthPredictorMultiViewPyramid(nn.Module):
                 trans_feature_i = trans_feature
                 pre_stage_residual = None
 
-            depths, densities, raw_gaussians, coarse_disps, pdf_max = depth_predictor(
+            # Pass MSH codec into depth predictor. target selects where MSH is
+            # applied: "pre_refine", "refine_out", or "raw_gaussians".
+            msh_codec = getattr(encoder, "msh_codec", None)
+            msh_compress_mode = getattr(encoder, "msh_compress_mode", "training")
+            msh_target = getattr(encoder, "msh_target", "refine_out")
+            msh_pre_refine_bypass_beta = 1.0
+            if msh_target == "pre_refine":
+                bypass_start = int(
+                    getattr(encoder, "compression_pre_refine_bypass_start_step", 0)
+                    or 0
+                )
+                bypass_warmup = int(
+                    getattr(encoder, "compression_pre_refine_bypass_warmup_steps", 0)
+                    or 0
+                )
+                global_step_raw = extra_info.get("global_step", 0)
+                if torch.is_tensor(global_step_raw):
+                    global_step = int(global_step_raw.item())
+                else:
+                    global_step = int(global_step_raw or 0)
+                beta_step = max(float(global_step - bypass_start), 0.0)
+                if bypass_warmup > 0:
+                    msh_pre_refine_bypass_beta = min(
+                        beta_step / float(bypass_warmup), 1.0
+                    )
+                else:
+                    msh_pre_refine_bypass_beta = (
+                        1.0 if global_step >= bypass_start else 0.0
+                    )
+            (
+                depths,
+                densities,
+                raw_gaussians,
+                coarse_disps,
+                pdf_max,
+                estimated_bits,
+                actual_bytes,
+                codec_input_orig,
+                codec_input_hat,
+            ) = depth_predictor(
                 trans_feature_i,
                 cnn_feature[i],
                 intrinsics,
@@ -232,7 +274,26 @@ class DepthPredictorMultiViewPyramid(nn.Module):
                 disp_candi_curr,
                 extra_info,
                 pre_stage_residual,
+                msh_codec=msh_codec,
+                msh_compress_mode=msh_compress_mode,
+                msh_target=msh_target,
+                msh_pre_refine_bypass_beta=msh_pre_refine_bypass_beta,
             )
+            if msh_target == "pre_refine":
+                result_dict[f"stage{i}"]["pre_refine_bypass_beta"] = (
+                    msh_pre_refine_bypass_beta
+                )
+            if estimated_bits is not None:
+                result_dict[f"stage{i}"]["estimated_bits"] = estimated_bits
+            if actual_bytes is not None:
+                result_dict[f"stage{i}"]["actual_bytes"] = actual_bytes
+            if codec_input_orig is not None and codec_input_hat is not None:
+                result_dict[f"stage{i}"]["codec_input_orig"] = codec_input_orig
+                result_dict[f"stage{i}"]["codec_input_hat"] = codec_input_hat
+                if msh_target == "refine_out":
+                    result_dict[f"stage{i}"]["refine_out_orig"] = codec_input_orig
+                    result_dict[f"stage{i}"]["refine_out_hat"] = codec_input_hat
+
             if depths is not None:
                 pre_depth = 1 / (
                     rearrange(depths, "b v (h w) () () -> (v b) () h w", h=depth_size[0], w=depth_size[1]) + 1e-8
@@ -518,6 +579,10 @@ class DepthPredictorRefine(nn.Module):
         disp_candi_curr,
         extra_info,
         pre_stage_residual,
+        msh_codec=None,
+        msh_compress_mode="training",
+        msh_target="refine_out",
+        msh_pre_refine_bypass_beta=1.0,
     ):
         # only warp the lowest resolution trans_feature and for the lowest resolution gaussian
         b, v, c, h, w = trans_feature.shape
@@ -577,10 +642,62 @@ class DepthPredictorRefine(nn.Module):
             )
         # depth refinement
         proj_feat_in_fullres = self.upsampler(torch.cat((feat01, cnn_feature), dim=1))
-        proj_feature = self.proj_feature(proj_feat_in_fullres)
         extra_img = F.interpolate(
             extra_info["images"], scale_factor=0.5**self.channel_stage_id, mode="bilinear", align_corners=True
         )
+
+        estimated_bits = None
+        actual_bytes = None
+        codec_input_orig = None
+        codec_input_hat = None
+
+        # --- MSH compression before refine_unet (MVSplat-style target) ---
+        # Bundle only the quantities that cannot be cheaply recomputed after
+        # decoding. proj_feature is derived from proj_feat_in_fullres and is
+        # therefore recomputed below from the decoded feature.
+        if msh_codec is not None and msh_target == "pre_refine":
+            bundle_parts = [extra_img, proj_feat_in_fullres, coarse_disps, pdf_max]
+            if self.stage_id != 0:
+                bundle_parts.append(pre_stage_residual)
+            bundle_channels = [part.shape[1] for part in bundle_parts]
+            codec_input_orig = torch.cat(bundle_parts, dim=1)
+
+            if msh_compress_mode == "bypass":
+                codec_input_hat = codec_input_orig
+            elif msh_compress_mode == "actual":
+                comp_out = msh_codec.compress(codec_input_orig, stage_id=self.stage_id)
+                dec_out = msh_codec.decompress(
+                    comp_out["strings"], comp_out["shape"],
+                    comp_out["orig_size"], stage_id=self.stage_id,
+                )
+                codec_input_hat = dec_out["x_hat"]
+                actual_bytes = sum(
+                    sum(len(s) for s in string_group)
+                    for string_group in comp_out["strings"]
+                )
+            else:
+                codec_out = msh_codec(codec_input_orig, stage_id=self.stage_id)
+                codec_input_hat = codec_out["x_hat"]
+                estimated_bits = codec_out["estimated_bits"]
+
+            codec_input_used = codec_input_hat
+            if self.training and msh_compress_mode != "actual":
+                beta = float(max(0.0, min(msh_pre_refine_bypass_beta, 1.0)))
+                if beta < 1.0:
+                    codec_input_clean = codec_input_orig.detach()
+                    codec_input_used = codec_input_clean + beta * (
+                        codec_input_hat - codec_input_clean
+                    )
+
+            decoded_parts = torch.split(codec_input_used, bundle_channels, dim=1)
+            extra_img = decoded_parts[0]
+            proj_feat_in_fullres = decoded_parts[1]
+            coarse_disps = decoded_parts[2]
+            pdf_max = decoded_parts[3]
+            if self.stage_id != 0:
+                pre_stage_residual = decoded_parts[4]
+
+        proj_feature = self.proj_feature(proj_feat_in_fullres)
         if self.stage_id == 0:
             refine_out = self.refine_unet(
                 torch.cat([extra_img, proj_feature, coarse_disps, pdf_max, proj_feat_in_fullres], dim=1)
@@ -591,13 +708,60 @@ class DepthPredictorRefine(nn.Module):
                     [extra_img, proj_feature, coarse_disps, pdf_max, proj_feat_in_fullres, pre_stage_residual], dim=1
                 )
             )
-        # gaussians head
+        # --- MSH compression on refine_out (before Gaussian & depth heads) ---
+        if msh_codec is not None and msh_target == "refine_out":
+            codec_input_orig = refine_out
+            if msh_compress_mode == "bypass":
+                codec_input_hat = codec_input_orig
+            elif msh_compress_mode == "actual":
+                comp_out = msh_codec.compress(codec_input_orig, stage_id=self.stage_id)
+                dec_out = msh_codec.decompress(
+                    comp_out["strings"], comp_out["shape"],
+                    comp_out["orig_size"], stage_id=self.stage_id,
+                )
+                codec_input_hat = dec_out["x_hat"]
+                actual_bytes = sum(
+                    sum(len(s) for s in string_group)
+                    for string_group in comp_out["strings"]
+                )
+            else:
+                codec_out = msh_codec(codec_input_orig, stage_id=self.stage_id)
+                codec_input_hat = codec_out["x_hat"]
+                estimated_bits = codec_out["estimated_bits"]
+            refine_out = codec_input_hat
+
+        # gaussians head (to_gaussians compensates for quantization noise)
         if self.stage_id == 0:
             raw_gaussians_in = [refine_out, extra_img, proj_feat_in_fullres]
         else:
             raw_gaussians_in = [refine_out, extra_img, proj_feat_in_fullres, pre_stage_residual]
         raw_gaussians_in = torch.cat(raw_gaussians_in, dim=1)
         raw_gaussians = self.to_gaussians(raw_gaussians_in)
+
+        # --- MSH compression on raw_gaussians (old target) ---
+        if msh_codec is not None and msh_target == "raw_gaussians":
+            codec_input_orig = raw_gaussians
+            if msh_compress_mode == "bypass":
+                codec_input_hat = codec_input_orig
+                raw_gaussians = codec_input_hat
+            elif msh_compress_mode == "actual":
+                comp_out = msh_codec.compress(raw_gaussians, stage_id=self.stage_id)
+                dec_out = msh_codec.decompress(
+                    comp_out["strings"], comp_out["shape"],
+                    comp_out["orig_size"], stage_id=self.stage_id,
+                )
+                raw_gaussians = dec_out["x_hat"]
+                codec_input_hat = raw_gaussians
+                actual_bytes = sum(
+                    sum(len(s) for s in string_group)
+                    for string_group in comp_out["strings"]
+                )
+            else:
+                codec_out = msh_codec(raw_gaussians, stage_id=self.stage_id)
+                raw_gaussians = codec_out["x_hat"]
+                codec_input_hat = raw_gaussians
+                estimated_bits = codec_out["estimated_bits"]
+
         raw_gaussians = rearrange(raw_gaussians, "(v b) c h w -> b v (h w) c", v=v, b=b)
         # delta fine depth and density
         delta_disps_density = self.to_disparity(refine_out)
@@ -638,7 +802,17 @@ class DepthPredictorRefine(nn.Module):
             srf=1,
         )
 
-        return depths, densities, raw_gaussians, coarse_disps, pdf_max
+        return (
+            depths,
+            densities,
+            raw_gaussians,
+            coarse_disps,
+            pdf_max,
+            estimated_bits,
+            actual_bytes,
+            codec_input_orig,
+            codec_input_hat,
+        )
 
 
 class Modulater(nn.Module):

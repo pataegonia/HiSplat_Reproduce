@@ -25,6 +25,7 @@ from ..dataset.types import BatchedExample
 from ..evaluation.metrics import compute_lpips, compute_psnr, compute_ssim
 from ..global_cfg import get_cfg
 from ..loss import Loss
+from ..loss.loss_rate import compute_rate_loss
 from ..misc.benchmarker import Benchmarker
 from ..misc.image_io import prep_image, save_batch_images, save_image, save_video
 from ..misc.LocalLogger import LOG_PATH, LocalLogger
@@ -62,6 +63,7 @@ class TestCfg:
     save_video: bool
     eval_time_skip_steps: int
     test_all_ckpt: bool
+    msh_compress_mode: str = "actual"
 
 
 @dataclass
@@ -73,6 +75,10 @@ class TrainCfg:
     align_3d: bool | float
     align_depth: bool | float
     normal_norm: bool
+    freeze_hisplat: bool = False       # Phase 1: freeze encoder+decoder, only train MSH
+    unfreeze_step: int = 0             # Phase 2: unfreeze after this step (0=never)
+    unfreeze_lr_scale: float = 0.1     # lr multiplier for unfrozen HiSplat params
+    render_loss_weight: float = 1.0    # 0 enables codec feature-AE pretraining
 
 
 @runtime_checkable
@@ -125,13 +131,35 @@ class ModelWrapper(LightningModule):
         self.losses = nn.ModuleList(losses)
         self.train_time = AverageMeter()
         self.bg_time = 0
+
+        # Phase 1: freeze HiSplat encoder+decoder, only train MSH codec
+        self._hisplat_frozen = False
+        if getattr(self.train_cfg, "freeze_hisplat", False):
+            self._freeze_hisplat()
+
         # For testing.
         self.benchmarker = Benchmarker()
         self.eval_cnt = 0
 
-        if self.test_cfg.compute_scores:
+        if self.test_cfg.compute_scores or getattr(self.encoder, "msh_codec", None) is not None:
             self.test_step_outputs = {}
             self.time_skip_steps_dict = {"encoder": 0, "decoder": 0}
+
+    @staticmethod
+    def _codec_feature_loss(codec_input_orig: Tensor, codec_input_hat: Tensor):
+        codec_input_orig = codec_input_orig.detach()
+        orig_abs = codec_input_orig.abs().mean()
+        hat_abs = codec_input_hat.detach().abs().mean()
+        diff_abs = (codec_input_hat - codec_input_orig).abs()
+        if codec_input_orig.ndim == 4:
+            denom = codec_input_orig.abs().mean(
+                dim=(0, 2, 3), keepdim=True
+            ).clamp_min(1e-2)
+            feat_loss = (diff_abs / denom).mean()
+        else:
+            denom = orig_abs.clamp_min(1e-2)
+            feat_loss = diff_abs.mean() / denom
+        return feat_loss, orig_abs, hat_abs
 
     def training_step(self, batch, batch_idx):
         max_steps = get_cfg().trainer.max_steps
@@ -142,33 +170,132 @@ class ModelWrapper(LightningModule):
         gaussian_dict, result_dict = self.encoder(batch["context"], self.global_step, False, scene_names=batch["scene"])
         target_gt = batch["target"]["image"]
         # For three resolutions, render them
-        total_loss = 0
+        total_loss = target_gt.new_tensor(0.0)
         loss_dict = {}
+        render_loss_weight = float(getattr(self.train_cfg, "render_loss_weight", 1.0) or 0.0)
+        self.log("loss/render_loss_weight", render_loss_weight)
+        loss_dict["render_w"] = render_loss_weight
+        if render_loss_weight > 0:
+            for i in range(len(gaussian_dict)):
+                gaussians = gaussian_dict[f"stage{i}"]["gaussians"]
+                output = self.decoder.forward(
+                    gaussians,
+                    batch["target"]["extrinsics"],
+                    batch["target"]["intrinsics"],
+                    batch["target"]["near"],
+                    batch["target"]["far"],
+                    (h, w),
+                    depth_mode=self.train_cfg.depth_mode,
+                )
+                # Compute metrics.
+                psnr_probabilistic = compute_psnr(
+                    rearrange(target_gt, "b v c h w -> (b v) c h w"),
+                    rearrange(output.color, "b v c h w -> (b v) c h w"),
+                )
+                self.log(f"train/psnr_probabilistic_stage{i}", psnr_probabilistic.mean())
+                sup_batch = copy.deepcopy(batch)
+                # Compute and log loss.
+                for loss_fn in self.losses:
+                    loss = loss_fn.forward(output, sup_batch, gaussians, self.global_step)
+                    weighted_loss = render_loss_weight * loss
+                    self.log(f"loss/{loss_fn.name}_{i}", loss)
+                    if render_loss_weight != 1.0:
+                        self.log(f"loss/{loss_fn.name}_weighted_{i}", weighted_loss)
+                    loss_dict[f"{loss_fn.name}_{i}"] = loss.item()
+                    total_loss = total_loss + weighted_loss
+        # MSH rate loss (per-stage weighted: shifts bits toward stage 2 since
+        # only stage 2 contributes to test PSNR).
+        msh_codec = getattr(self.encoder, "msh_codec", None)
+        if msh_codec is not None:
+            lmbda = getattr(self.encoder, "compression_lmbda", 0.0)
+            stage_weights = getattr(
+                self.encoder, "compression_lambda_stage_weights",
+                [1.0, 1.0, 1.0],
+            )
+            num_pixels = b * tar_v * h * w
+            for i in range(len(gaussian_dict)):
+                est_bits = result_dict[f"stage{i}"].get("estimated_bits", None)
+                if est_bits is not None:
+                    bpp = compute_rate_loss(est_bits, num_pixels)
+                    if not torch.isfinite(bpp):
+                        if self.global_rank == 0:
+                            print(
+                                f"[MSH warning] non-finite bpp at "
+                                f"step={self.global_step}, stage={i}; "
+                                "skipping this stage's rate loss."
+                            )
+                        continue
+                    w = stage_weights[i] if i < len(stage_weights) else 1.0
+                    rate_loss = lmbda * w * bpp
+                    total_loss = total_loss + rate_loss
+                    self.log(f"loss/bpp_stage{i}", bpp)
+                    loss_dict[f"bpp_{i}"] = bpp.item()
+
+            entropy_aux_weight = float(
+                getattr(self.encoder, "compression_entropy_aux_weight", 0.0)
+                or 0.0
+            )
+            if entropy_aux_weight > 0:
+                aux_loss = msh_codec.entropy_aux_loss()
+                total_loss = total_loss + entropy_aux_weight * aux_loss
+                self.log("loss/entropy_aux", aux_loss)
+                self.log("loss/entropy_aux_weight", entropy_aux_weight)
+                loss_dict["entropy_aux"] = aux_loss.item()
+
         for i in range(len(gaussian_dict)):
-            gaussians = gaussian_dict[f"stage{i}"]["gaussians"]
-            pre_output = None if i == 0 else output
-            output = self.decoder.forward(
-                gaussians,
-                batch["target"]["extrinsics"],
-                batch["target"]["intrinsics"],
-                batch["target"]["near"],
-                batch["target"]["far"],
-                (h, w),
-                depth_mode=self.train_cfg.depth_mode,
+            stage_result = result_dict.get(f"stage{i}", {})
+            bypass_beta = stage_result.get("pre_refine_bypass_beta", None)
+            if bypass_beta is not None:
+                bypass_beta = float(bypass_beta)
+                self.log(f"info/pre_refine_bypass_beta_stage{i}", bypass_beta)
+                loss_dict[f"bypass_beta_{i}"] = bypass_beta
+
+        feat_loss_alpha = float(getattr(self.encoder, "compression_feat_loss_alpha", 0.0) or 0.0)
+        if feat_loss_alpha > 0:
+            warmup_steps = int(getattr(self.encoder, "compression_feat_loss_warmup_steps", 5000) or 0)
+            start_step = int(getattr(self.encoder, "compression_feat_loss_start_step", 0) or 0)
+            alpha_step = max(float(self.global_step - start_step), 0.0)
+            if warmup_steps > 0:
+                feat_alpha_t = min(alpha_step / float(warmup_steps), 1.0) * feat_loss_alpha
+            else:
+                feat_alpha_t = feat_loss_alpha if self.global_step >= start_step else 0.0
+            self.log("loss/feat_alpha", feat_alpha_t)
+            loss_dict["feat_alpha"] = feat_alpha_t
+            feat_stage_weights = getattr(
+                self.encoder, "compression_feat_loss_stage_weights",
+                [1.0, 1.0, 1.0],
             )
-            # Compute metrics.
-            psnr_probabilistic = compute_psnr(
-                rearrange(target_gt, "b v c h w -> (b v) c h w"),
-                rearrange(output.color, "b v c h w -> (b v) c h w"),
-            )
-            self.log(f"train/psnr_probabilistic_stage{i}", psnr_probabilistic.mean())
-            sup_batch = copy.deepcopy(batch)
-            # Compute and log loss.
-            for loss_fn in self.losses:
-                loss = loss_fn.forward(output, sup_batch, gaussians, self.global_step)
-                self.log(f"loss/{loss_fn.name}_{i}", loss)
-                loss_dict[f"{loss_fn.name}_{i}"] = loss.item()
-                total_loss = total_loss + loss
+
+            for i in range(len(gaussian_dict)):
+                stage_result = result_dict.get(f"stage{i}", {})
+                codec_input_orig = stage_result.get(
+                    "codec_input_orig",
+                    stage_result.get("refine_out_orig", None),
+                )
+                codec_input_hat = stage_result.get(
+                    "codec_input_hat",
+                    stage_result.get("refine_out_hat", None),
+                )
+                if codec_input_orig is None or codec_input_hat is None:
+                    continue
+                feat_loss, orig_abs, hat_abs = self._codec_feature_loss(
+                    codec_input_orig, codec_input_hat
+                )
+                feat_weight = feat_stage_weights[i] if i < len(feat_stage_weights) else 1.0
+                total_loss = total_loss + feat_alpha_t * feat_weight * feat_loss
+                self.log(f"loss/feat_stage{i}", feat_loss)
+                self.log(f"info/codec_orig_abs_stage{i}", orig_abs)
+                self.log(f"info/codec_hat_abs_stage{i}", hat_abs)
+                loss_dict[f"feat_{i}"] = feat_loss.item()
+
+        if not torch.isfinite(total_loss):
+            if self.global_rank == 0:
+                print(
+                    f"[MSH warning] non-finite total loss at "
+                    f"step={self.global_step}; skipping optimizer update."
+                )
+            total_loss = torch.zeros((), device=target_gt.device, requires_grad=True)
+
         if self.global_rank == 0 and self.global_step % self.train_cfg.print_log_every_n_steps == 0:
             print(
                 f"train step[{self.global_step}/{get_cfg().trainer.max_steps}] ; "
@@ -189,12 +316,22 @@ class ModelWrapper(LightningModule):
 
     """ Log the time"""
 
-    def on_train_batch_start(self, batch, batch_idex):
+    def _log_train_time(self):
         if self.train_time.avg == 0:
             self.train_time.update(0.0001)
         else:
             self.train_time.update(time.time() - self.bg_time)
         self.bg_time = time.time()
+
+    def on_test_start(self) -> None:
+        # Build CDF tables so MSH codec can do real arithmetic coding during test.
+        # CompressAI's EntropyBottleneck/GaussianConditional keep no CDFs during
+        # training (STE path only), so compress() would raise
+        # "Uninitialized CDFs. Run update() first" without this call.
+        msh_codec = getattr(self.encoder, "msh_codec", None)
+        test_msh_mode = getattr(self.test_cfg, "msh_compress_mode", "actual")
+        if msh_codec is not None and test_msh_mode == "actual":
+            msh_codec.update(force=True)
 
     def test_step(self, batch, batch_idx):
         # extrinsic: [b, mv, 4, 4]
@@ -204,11 +341,26 @@ class ModelWrapper(LightningModule):
         b, v, _, h, w = batch["target"]["image"].shape
         assert b == 1
 
+        # Use actual entropy coding during test if MSH codec exists
+        msh_codec = getattr(self.encoder, "msh_codec", None)
+        test_msh_mode = getattr(self.test_cfg, "msh_compress_mode", "actual")
+        if test_msh_mode not in ("actual", "training", "bypass"):
+            raise ValueError(
+                f"Unknown test.msh_compress_mode={test_msh_mode}. "
+                "Expected 'actual', 'training', or 'bypass'."
+            )
+        if msh_codec is not None:
+            self.encoder.msh_compress_mode = test_msh_mode
+
         # Render Gaussians.
         with self.benchmarker.time("encoder"):
             gaussian_dict, result_dict = self.encoder(
                 batch["context"], self.global_step, False, scene_names=batch["scene"]
             )
+
+        # Restore training mode
+        if msh_codec is not None:
+            self.encoder.msh_compress_mode = "training"
         with self.benchmarker.time("decoder", num_calls=v):
             gaussians = gaussian_dict[f"stage2"]["gaussians"]
             output = self.decoder.forward(
@@ -225,6 +377,48 @@ class ModelWrapper(LightningModule):
         path = self.test_cfg.output_path / name
         images_prob = output.color[0]
         rgb_gt = batch["target"]["image"][0]
+
+        # Log actual bitstream size (KB) per stage
+        if msh_codec is not None and test_msh_mode == "actual":
+            total_bytes = 0
+            for i in range(len(gaussian_dict)):
+                ab = result_dict.get(f"stage{i}", {}).get("actual_bytes", None)
+                if ab is not None:
+                    total_bytes += ab
+                    if f"actual_kb_stage{i}" not in self.test_step_outputs:
+                        self.test_step_outputs[f"actual_kb_stage{i}"] = []
+                    self.test_step_outputs[f"actual_kb_stage{i}"].append(ab / 1024)
+            if f"actual_kb_total" not in self.test_step_outputs:
+                self.test_step_outputs[f"actual_kb_total"] = []
+            self.test_step_outputs[f"actual_kb_total"].append(total_bytes / 1024)
+
+        # Stage-wise codec reconstruction diagnostics. Comparing these between
+        # test.msh_compress_mode=training and actual exposes STE/bitstream gaps.
+        if msh_codec is not None:
+            for i in range(len(gaussian_dict)):
+                stage_result = result_dict.get(f"stage{i}", {})
+                codec_input_orig = stage_result.get(
+                    "codec_input_orig",
+                    stage_result.get("refine_out_orig", None),
+                )
+                codec_input_hat = stage_result.get(
+                    "codec_input_hat",
+                    stage_result.get("refine_out_hat", None),
+                )
+                if codec_input_orig is None or codec_input_hat is None:
+                    continue
+                feat_loss, orig_abs, hat_abs = self._codec_feature_loss(
+                    codec_input_orig, codec_input_hat
+                )
+                self.test_step_outputs.setdefault(
+                    f"test_feat_stage{i}", []
+                ).append(feat_loss.item())
+                self.test_step_outputs.setdefault(
+                    f"test_codec_orig_abs_stage{i}", []
+                ).append(orig_abs.item())
+                self.test_step_outputs.setdefault(
+                    f"test_codec_hat_abs_stage{i}", []
+                ).append(hat_abs.item())
 
         # save video
         if self.test_cfg.save_video:
@@ -251,6 +445,31 @@ class ModelWrapper(LightningModule):
             self.test_step_outputs[f"psnr"].append(psnr.mean().item())
             self.test_step_outputs[f"ssim"].append(ssim.mean().item())
             self.test_step_outputs[f"lpips"].append(lpips.mean().item())
+
+            # Per-stage quality: render each stage's gaussians independently
+            # so we can pair them with the already-recorded actual_kb_stage{i}
+            # to build per-stage R-D curves.
+            for stage_id in range(len(gaussian_dict)):
+                stage_key = f"stage{stage_id}"
+                if stage_key not in gaussian_dict:
+                    continue
+                stage_gaussians = gaussian_dict[stage_key]["gaussians"]
+                stage_output = self.decoder.forward(
+                    stage_gaussians,
+                    batch["target"]["extrinsics"],
+                    batch["target"]["intrinsics"],
+                    batch["target"]["near"],
+                    batch["target"]["far"],
+                    (h, w),
+                    depth_mode=self.train_cfg.depth_mode,
+                )
+                stage_rgb = stage_output.color[0]
+                s_psnr = compute_psnr(rgb_gt, stage_rgb).mean().item()
+                s_ssim = compute_ssim(rgb_gt, stage_rgb).mean().item()
+                s_lpips = compute_lpips(rgb_gt, stage_rgb).mean().item()
+                self.test_step_outputs.setdefault(f"psnr_stage{stage_id}", []).append(s_psnr)
+                self.test_step_outputs.setdefault(f"ssim_stage{stage_id}", []).append(s_ssim)
+                self.test_step_outputs.setdefault(f"lpips_stage{stage_id}", []).append(s_lpips)
             # Create the parent directory if it doesn't already exist.
             log_path = path / scene / "psnr.txt"
             psnr_log = [f"example{j}: {psnr[j].item():.2f} \n" for j in range(len(psnr))]
@@ -317,6 +536,24 @@ class ModelWrapper(LightningModule):
         assert b == 1
         # Run the model and get gaussians
         gaussian_dict, result_dict = self.encoder(batch["context"], self.global_step, False, scene_names=batch["scene"])
+        for i in range(len(gaussian_dict)):
+            stage_result = result_dict.get(f"stage{i}", {})
+            codec_input_orig = stage_result.get(
+                "codec_input_orig",
+                stage_result.get("refine_out_orig", None),
+            )
+            codec_input_hat = stage_result.get(
+                "codec_input_hat",
+                stage_result.get("refine_out_hat", None),
+            )
+            if codec_input_orig is None or codec_input_hat is None:
+                continue
+            feat_loss, orig_abs, hat_abs = self._codec_feature_loss(
+                codec_input_orig, codec_input_hat
+            )
+            self.log(f"val/feat_stage{i}", feat_loss)
+            self.log(f"val/codec_orig_abs_stage{i}", orig_abs)
+            self.log(f"val/codec_hat_abs_stage{i}", hat_abs)
         output_list = []
         # for debug
         render_img_debug_list = []
@@ -567,12 +804,112 @@ class ModelWrapper(LightningModule):
                 dir.mkdir(exist_ok=True, parents=True)
                 clip.write_videofile(str(dir / f"{self.global_step:0>6}.mp4"), logger=None)
 
+    # ---- freeze / unfreeze helpers for MSH training ----
+
+    def _freeze_hisplat(self):
+        """Freeze HiSplat for Phase 1 MSH training.
+
+        For target="pre_refine", only the MSH codec is trainable so the
+        experiment asks whether the frozen generator tolerates compressed
+        pre-refine features. For target="refine_out", the lightweight heads
+        remain trainable because they sit after the codec.
+        """
+        # Collect param ids that should stay trainable
+        trainable_ids = set()
+
+        msh_codec = getattr(self.encoder, "msh_codec", None)
+        if msh_codec is not None:
+            trainable_ids.update(id(p) for p in msh_codec.parameters())
+
+        # For "refine_out" target, heads receive compressed features and can
+        # compensate for quantization noise. For "pre_refine" and
+        # "raw_gaussians", heads stay frozen.
+        msh_target = getattr(self.encoder, "msh_target", "refine_out")
+        render_loss_weight = float(getattr(self.train_cfg, "render_loss_weight", 1.0) or 0.0)
+        if msh_target == "refine_out" and render_loss_weight > 0:
+            depth_pred = getattr(self.encoder, "depth_predictor", None)
+            if depth_pred is not None:
+                for stage_pred in depth_pred.depth_predictor:
+                    for module_name in ("to_gaussians", "to_disparity", "lim_surf"):
+                        module = getattr(stage_pred, module_name, None)
+                        if module is not None:
+                            trainable_ids.update(id(p) for p in module.parameters())
+
+        frozen_count = 0
+        trainable_count = 0
+        for p in self.parameters():
+            if id(p) not in trainable_ids:
+                p.requires_grad = False
+                frozen_count += 1
+            else:
+                trainable_count += 1
+        self._hisplat_frozen = True
+        trainable_desc = (
+            "MSH codec + heads"
+            if msh_target == "refine_out" and render_loss_weight > 0
+            else "MSH codec only"
+        )
+        print(f"[MSH Phase 1] Froze {frozen_count} params, "
+              f"kept {trainable_count} trainable ({trainable_desc})")
+
+    def _unfreeze_hisplat(self):
+        """Unfreeze all parameters (Phase 2 fine-tune)."""
+        for p in self.parameters():
+            p.requires_grad = True
+        self._hisplat_frozen = False
+        print(f"[MSH Phase 2] Unfroze all parameters for fine-tuning")
+
+    def on_train_batch_start(self, batch, batch_idx):
+        """Log time + check if it's time to unfreeze HiSplat for Phase 2."""
+        self._log_train_time()
+        unfreeze_step = getattr(self.train_cfg, "unfreeze_step", 0)
+        if (self._hisplat_frozen
+                and unfreeze_step > 0
+                and self.global_step >= unfreeze_step):
+            self._unfreeze_hisplat()
+            # Differential lr is already set in configure_optimizers
+            # (hisplat=lr*scale, msh=lr). Just unfreeze is enough.
+
     def configure_optimizers(self):
-        optimizer = optim.Adam(self.parameters(), lr=self.optimizer_cfg.lr)
+        base_lr = self.optimizer_cfg.lr
+        # If MSH codec exists, use two lr groups:
+        #   - HiSplat generator params (lr * scale, frozen in Phase 1)
+        #   - codec, plus heads only for target="refine_out" (full lr)
+        msh_codec = getattr(self.encoder, "msh_codec", None)
+        if msh_codec is not None:
+            # Collect full-lr param ids. For "refine_out" target, heads are
+            # also at full lr; for "pre_refine" and "raw_gaussians", only
+            # the MSH codec is in this group.
+            full_lr_ids = set()
+            full_lr_ids.update(id(p) for p in msh_codec.parameters())
+            msh_target = getattr(self.encoder, "msh_target", "refine_out")
+            render_loss_weight = float(getattr(self.train_cfg, "render_loss_weight", 1.0) or 0.0)
+            if msh_target == "refine_out" and render_loss_weight > 0:
+                depth_pred = getattr(self.encoder, "depth_predictor", None)
+                if depth_pred is not None:
+                    for stage_pred in depth_pred.depth_predictor:
+                        for mod_name in ("to_gaussians", "to_disparity", "lim_surf"):
+                            mod = getattr(stage_pred, mod_name, None)
+                            if mod is not None:
+                                full_lr_ids.update(id(p) for p in mod.parameters())
+
+            backbone_params = [p for p in self.parameters() if id(p) not in full_lr_ids]
+            codec_and_head_params = [p for p in self.parameters() if id(p) in full_lr_ids]
+            lr_scale = getattr(self.train_cfg, "unfreeze_lr_scale", 0.1)
+            optimizer = optim.Adam([
+                {"params": backbone_params, "lr": base_lr * lr_scale},
+                {"params": codec_and_head_params, "lr": base_lr},
+            ])
+            # OneCycleLR needs max_lr per group
+            max_lrs = [base_lr * lr_scale, base_lr]
+        else:
+            optimizer = optim.Adam(self.parameters(), lr=base_lr)
+            max_lrs = base_lr
+
         if self.optimizer_cfg.cosine_lr:
             warm_up = torch.optim.lr_scheduler.OneCycleLR(
                 optimizer,
-                self.optimizer_cfg.lr,
+                max_lrs,
                 self.trainer.max_steps + 10,
                 pct_start=0.01,
                 cycle_momentum=False,
